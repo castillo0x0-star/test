@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Warhammer ELO</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section class="card">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Warhammer 40k</p>
+            <h1>Ranking ELO</h1>
+          </div>
+        </header>
+
+        <form id="searchForm" class="search-form">
+          <label for="playerName">Nombre del jugador</label>
+          <div class="input-row">
+            <input
+              id="playerName"
+              name="playerName"
+              type="text"
+              placeholder="Ej: GitHub Copilot"
+              autocomplete="off"
+            />
+            <button type="submit">Buscar</button>
+          </div>
+        </form>
+
+        <section id="playerCard" class="player-card hidden">
+          <div class="badge">Jugador</div>
+          <h2 id="playerNameCard">-</h2>
+          <div class="stats">
+            <div>
+              <span class="label">ELO</span>
+              <strong id="playerElo">-</strong>
+            </div>
+            <div>
+              <span class="label">Victorias</span>
+              <strong id="playerWins">-</strong>
+            </div>
+            <div>
+              <span class="label">Derrotas</span>
+              <strong id="playerLosses">-</strong>
+            </div>
+          </div>
+        </section>
+
+        <section class="table-wrap">
+          <h2>Top jugadores</h2>
+          <p id="rankingStatus" class="ranking-status" role="status"></p>
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Jugador</th>
+                <th>ELO</th>
+                <th>W</th>
+                <th>L</th>
+              </tr>
+            </thead>
+            <tbody id="leaderboardBody"></tbody>
+          </table>
+        </section>
+      </section>
+    </main>
+
+    <script src="script.js?v=2"></script>
+  </body>
+</html>

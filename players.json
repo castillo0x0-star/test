@@ -1,0 +1,12 @@
+[
+  {"name": "Dani", "placement": 1, "points": 100, "faction": "Adeptus Custodes"},
+  {"name": "Arturo", "placement": 2, "points": 98, "faction": "Space Marines"},
+  {"name": "Daniel", "placement": 3, "points": 97, "faction": "Orks"},
+  {"name": "Javits", "placement": 4, "points": 96, "faction": "Aeldari"},
+  {"name": "Aldari", "placement": 5, "points": 95, "faction": "Reclamation"},
+  {"name": "Dimas", "placement": 6, "points": 94, "faction": "Chaos Daemons"},
+  {"name": "Lucía", "placement": 7, "points": 90, "faction": "T'au"},
+  {"name": "Mikel", "placement": 8, "points": 87, "faction": "Necrons"},
+  {"name": "Sara", "placement": 9, "points": 84, "faction": "Adepta Sororitas"},
+  {"name": "Pedro", "placement": 10, "points": 82, "faction": "Tyranids"}
+]
