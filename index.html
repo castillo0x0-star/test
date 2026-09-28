@@ -31,7 +31,7 @@
         </form>
 
         <section id="playerCard" class="player-card hidden">
-          <div class="badge">Jugador</div>
+          <div id="playerRank" class="badge">Jugador</div>
           <h2 id="playerNameCard">-</h2>
           <div class="stats">
             <div>
@@ -64,10 +64,15 @@
             </thead>
             <tbody id="leaderboardBody"></tbody>
           </table>
+          <nav id="rankingPagination" class="pagination" aria-label="Paginación del ranking" hidden>
+            <button id="previousPage" type="button">Anterior</button>
+            <span id="pageIndicator" aria-live="polite"></span>
+            <button id="nextPage" type="button">Siguiente</button>
+          </nav>
         </section>
       </section>
     </main>
 
-    <script src="script.js?v=2"></script>
+    <script src="script.js?v=5"></script>
   </body>
 </html>

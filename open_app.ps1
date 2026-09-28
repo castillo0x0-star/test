@@ -5,8 +5,10 @@ Get-NetTCPConnection -LocalPort 8000 -ErrorAction SilentlyContinue | ForEach-Obj
     Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue
 }
 
-$env:PLAYERS_JSON_URL = "https://www.bestcoastpairings.com/event/SJTihBbRPKwQ?active_tab=placings"
-$server = Start-Process -FilePath "python" -ArgumentList "app.py" -WorkingDirectory $PSScriptRoot -PassThru
+Remove-Item Env:PLAYERS_JSON_URL -ErrorAction SilentlyContinue
+Remove-Item Env:JSON_URL -ErrorAction SilentlyContinue
+$pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
+$server = Start-Process -FilePath $pythonPath -ArgumentList "app.py" -WorkingDirectory $PSScriptRoot -PassThru
 
 try {
     $ready = $false

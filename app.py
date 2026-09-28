@@ -1,23 +1,42 @@
+import hashlib
 import json
 import os
 import re
+import sqlite3
 import ssl
+import time as time_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from html import unescape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
 DATA_FILE = ROOT / "players.json"
 MATCHES_FILE = ROOT / "matches.json"
+CACHE_DB_FILE = ROOT / "ranking_cache.sqlite3"
 JSON_URL = os.environ.get("PLAYERS_JSON_URL") or os.environ.get("JSON_URL")
 PORT = 8000
 BCP_ROOT = "https://lrs9glzzsf.execute-api.us-east-1.amazonaws.com/prod/"
 BCP_API_ROOT = "https://newprod-api.bestcoastpairings.com/v1/"
+BCP_V2_API_ROOT = "https://newprod-api.bestcoastpairings.com/v2/"
 BCP_CLIENT_ID = "web-app"
+BCP_GAME_SYSTEM_ID = "WGMSzfKFYA"
+RANKING_START_YEAR = 2025
+BCP_SEARCH_AREAS = (
+    {"center": {"lat": 40.2, "long": -3.6}, "distance": 700},
+    {"center": {"lat": 28.1, "long": -15.5}, "distance": 350},
+)
+SPAIN_COUNTRY_NAMES = {"es", "españa", "spain"}
 K_FACTOR = 32
-DEFAULT_ELO = 1500
+DEFAULT_ELO = 1700
+CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
+RANKING_CACHE_VERSION = 6
+PLAYERS_CACHE = {"key": None, "expires_at": 0, "payload": None}
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -158,7 +177,7 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
     if not participants:
         return []
 
-    cleaned = []
+    cleaned_by_name = {}
     for index, item in enumerate(participants):
         if not isinstance(item, dict):
             continue
@@ -190,18 +209,29 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
             else extract_metric_value(item, "Losses")
         )
 
-        cleaned.append({
+        candidate = {
             "name": name,
             "placement": placement,
             "points": points,
             "wins": extract_metric_value(item, "Wins"),
             "losses": losses,
-        })
+        }
+        name_key = name.casefold()
+        existing = cleaned_by_name.get(name_key)
+        if existing:
+            existing["placement"] = min(existing["placement"], placement)
+            existing["points"] += points or 0
+            if candidate["wins"] is not None:
+                existing["wins"] = (existing["wins"] or 0) + candidate["wins"]
+            if candidate["losses"] is not None:
+                existing["losses"] = (existing["losses"] or 0) + candidate["losses"]
+        else:
+            cleaned_by_name[name_key] = candidate
 
-    if not cleaned:
+    if not cleaned_by_name:
         return []
 
-    ranked = sorted(cleaned, key=lambda item: item["placement"])
+    ranked = sorted(cleaned_by_name.values(), key=lambda item: item["placement"])
     canonical_names = {player["name"].casefold(): player["name"] for player in ranked}
     initial_ratings = initial_ratings or {}
     elo = {
@@ -209,7 +239,7 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
         for player in ranked
     }
 
-    for match in sorted(matches or [], key=lambda item: item["round"]):
+    for match in sorted(matches or [], key=lambda item: (item.get("event_date", ""), item["round"])):
         player_name = canonical_names.get(match["player"].casefold())
         opponent_name = canonical_names.get(match["opponent"].casefold())
         if not player_name or not opponent_name:
@@ -242,46 +272,120 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
     return sorted(players, key=lambda item: (-item["elo"], -(item["wins"] or 0), item["name"]))
 
 
-def load_bcp_match_results(event_id):
-    payload = fetch_json(
-        f"{BCP_API_ROOT}pairings",
-        {
+def fetch_bcp_pairings(params):
+    pairings_by_id = {}
+    next_key = None
+    for _ in range(100):
+        page_params = {
+            **params,
             "limit": 100,
-            "eventId": event_id,
             "pairingType": "Pairing",
             "expand[]": ["player1", "player2", "player1Game", "player2Game"],
-        },
-        {"client-id": BCP_CLIENT_ID},
-    )
-    pairings = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(pairings, list):
-        raise ValueError("BCP no devolvió una lista de emparejamientos.")
+        }
+        if next_key:
+            page_params["nextKey"] = next_key
+        payload = fetch_json(
+            f"{BCP_API_ROOT}pairings",
+            page_params,
+            {"client-id": BCP_CLIENT_ID},
+        )
+        page = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(page, list):
+            raise ValueError("BCP no devolvió una lista de emparejamientos.")
+        added_pairing = False
+        for pairing in page:
+            pairing_id = pairing.get("id") or pairing.get("pairingId")
+            if pairing_id and pairing_id not in pairings_by_id:
+                pairings_by_id[pairing_id] = pairing
+                added_pairing = True
+        if not added_pairing:
+            break
+        updated_next_key = payload.get("nextKey")
+        if not updated_next_key or updated_next_key == next_key:
+            break
+        next_key = updated_next_key
+    return list(pairings_by_id.values())
+
+
+def pairing_to_match(pairing):
+    if not isinstance(pairing, dict) or not pairing.get("isDone"):
+        return None
+
+    player1 = normalize_player_name(pairing.get("player1"))
+    player2 = normalize_player_name(pairing.get("player2"))
+    metadata = pairing.get("metaData") or {}
+    game1 = pairing.get("player1Game") or {}
+    game2 = pairing.get("player2Game") or {}
+    points1 = metadata.get("p1-victoryPoints")
+    points2 = metadata.get("p2-victoryPoints")
+    if points1 is None:
+        points1 = game1.get("totalMoVVictoryPoints")
+    if points2 is None:
+        points2 = game2.get("totalMoVVictoryPoints")
+    if points1 is None:
+        points1 = game1.get("gamePoints", metadata.get("p1-gamePoints"))
+    if points2 is None:
+        points2 = game2.get("gamePoints", metadata.get("p2-gamePoints"))
+    if (
+        not player1
+        or not player2
+        or player1.casefold() == player2.casefold()
+        or points1 is None
+        or points2 is None
+    ):
+        return None
+
+    try:
+        points1 = float(points1)
+        points2 = float(points2)
+    except (TypeError, ValueError):
+        return None
+
+    return {
+        "round": int(pairing.get("round", 1)),
+        "player": player1,
+        "opponent": player2,
+        "player_points": points1,
+        "opponent_points": points2,
+    }
+
+
+def load_bcp_match_results(event_id, participants=None):
+    pairings = fetch_bcp_pairings({"eventId": event_id})
+    if not pairings and participants:
+        pairings_by_id = {}
+        participants_with_games = [
+            participant
+            for participant in participants
+            if participant.get("id") and participant.get("games")
+        ]
+        if participants_with_games:
+            with ThreadPoolExecutor(max_workers=min(4, len(participants_with_games))) as executor:
+                futures = {
+                    executor.submit(fetch_bcp_pairings, {"playerId": participant["id"]}): participant["id"]
+                    for participant in participants_with_games
+                }
+                for future in as_completed(futures):
+                    player_id = futures[future]
+                    try:
+                        player_pairings = future.result()
+                    except Exception as exc:
+                        print(f"BCP player pairings unavailable ({player_id}): {exc}")
+                        continue
+                    for pairing in player_pairings:
+                        if pairing.get("eventId") != event_id:
+                            continue
+                        pairing_id = pairing.get("id") or pairing.get("pairingId")
+                        if pairing_id:
+                            pairings_by_id[pairing_id] = pairing
+        pairings = list(pairings_by_id.values())
 
     matches = []
     for pairing in pairings:
-        if not isinstance(pairing, dict) or not pairing.get("isDone"):
-            continue
+        match = pairing_to_match(pairing)
+        if match:
+            matches.append(match)
 
-        player1 = normalize_player_name(pairing.get("player1"))
-        player2 = normalize_player_name(pairing.get("player2"))
-        metadata = pairing.get("metaData") or {}
-        game1 = pairing.get("player1Game") or {}
-        game2 = pairing.get("player2Game") or {}
-        points1 = game1.get("gamePoints", metadata.get("p1-gamePoints"))
-        points2 = game2.get("gamePoints", metadata.get("p2-gamePoints"))
-        if not player1 or not player2 or points1 is None or points2 is None:
-            continue
-
-        matches.append({
-            "round": int(pairing.get("round", 1)),
-            "player": player1,
-            "opponent": player2,
-            "player_points": float(points1),
-            "opponent_points": float(points2),
-        })
-
-    if not matches:
-        raise ValueError("BCP no devolvió partidas completadas con sus dos puntuaciones.")
     return matches
 
 
@@ -395,19 +499,22 @@ def load_players_from_url(url, matches=None, initial_ratings=None):
                 {"placings": "true"},
                 {"client-id": BCP_CLIENT_ID},
             )
+            roster = extract_players_from_payload(payload)
+            if not roster:
+                return None, "La URL respondió, pero no contiene una lista de jugadores reconocida.", None
             if matches:
                 elo_message = f"ELO calculado con {len(matches)} partidas de matches.json, K={K_FACTOR}."
             else:
-                matches = load_bcp_match_results(event_id)
+                matches = load_bcp_match_results(event_id, roster)
                 elo_message = f"ELO calculado con {len(matches)} partidas de BCP, K={K_FACTOR}."
         else:
             payload = fetch_json(url)
+            roster = extract_players_from_payload(payload)
 
     except Exception as exc:
         print(f"Remote JSON unavailable: {exc}")
         return None, f"No se pudo consultar la URL: {type(exc).__name__}: {exc}", None
 
-    roster = extract_players_from_payload(payload)
     if not roster:
         return None, "La URL respondió, pero no contiene una lista de jugadores reconocida.", None
 
@@ -419,6 +526,173 @@ def load_players_from_url(url, matches=None, initial_ratings=None):
         return None, "La URL respondió, pero no se pudieron interpretar sus jugadores.", None
 
     return calculated, None, elo_message
+
+
+def ranking_period_window():
+    try:
+        local_zone = ZoneInfo("Europe/Madrid")
+    except ZoneInfoNotFoundError:
+        local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+
+    local_now = datetime.now(local_zone)
+    first_day = datetime(RANKING_START_YEAR, 1, 1, tzinfo=local_zone)
+    start_utc = first_day.astimezone(timezone.utc)
+    end_utc = local_now.astimezone(timezone.utc)
+    return RANKING_START_YEAR, local_now.year, local_zone, local_now, start_utc, end_utc
+
+
+def load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_utc):
+    base_params = {
+        "limit": 100,
+        "startDate": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "endDate": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sortKey": "eventDate",
+        "sortAscending": "true",
+        "sortAsc": "true",
+        "gameSystemId": BCP_GAME_SYSTEM_ID,
+        "excludeOnline": "true",
+        "distanceType": "kms",
+        "eventStatus": "all",
+    }
+
+    events_by_id = {}
+    for area in BCP_SEARCH_AREAS:
+        next_key = None
+        for _ in range(100):
+            params = dict(base_params)
+            params["location"] = json.dumps({
+                **area,
+                "distanceType": "kms",
+            }, separators=(",", ":"))
+            if next_key:
+                params["nextKey"] = next_key
+            payload = fetch_json(f"{BCP_V2_API_ROOT}events", params, {"client-id": BCP_CLIENT_ID})
+            page_events = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(page_events, list) or not page_events:
+                break
+
+            for event in page_events:
+                country = str((event.get("location") or {}).get("country", "")).strip().casefold()
+                if event.get("isOnlineEvent") or country not in SPAIN_COUNTRY_NAMES:
+                    continue
+                start_value = (event.get("dates") or {}).get("start")
+                if not start_value:
+                    continue
+                try:
+                    event_start = datetime.fromisoformat(start_value.replace("Z", "+00:00"))
+                    event_start = event_start.astimezone(local_zone)
+                except (TypeError, ValueError):
+                    continue
+                if event_start.year < start_year or event_start > cutoff_local:
+                    continue
+                if event.get("id"):
+                    events_by_id[event["id"]] = event
+
+            new_next_key = payload.get("nextKey") if isinstance(payload, dict) else None
+            if not new_next_key or new_next_key == next_key:
+                break
+            next_key = new_next_key
+
+    return sorted(
+        events_by_id.values(),
+        key=lambda event: (event.get("dates") or {}).get("start", ""),
+    )
+
+
+def load_bcp_event_data(event):
+    event_id = event["id"]
+    participants = []
+    matches = []
+    for attempt in range(3):
+        try:
+            player_payload = fetch_json(
+                f"{BCP_API_ROOT}events/{event_id}/players",
+                {"placings": "true"},
+                {"client-id": BCP_CLIENT_ID},
+            )
+            participants = extract_players_from_payload(player_payload)
+            matches = load_bcp_match_results(event_id, participants)
+            break
+        except Exception as exc:
+            if isinstance(exc, HTTPError) and 400 <= exc.code < 500 and exc.code != 429:
+                raise
+            if attempt == 2:
+                raise
+            time_module.sleep(0.5 * (attempt + 1))
+
+    event_date = (event.get("dates") or {}).get("start", "")
+    for match in matches:
+        match["event_date"] = event_date
+    return participants, matches
+
+
+def load_players_from_spain_since_2025(matches_override, initial_ratings):
+    start_year, end_year, local_zone, cutoff_local, start_utc, end_utc = ranking_period_window()
+    events = load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_utc)
+    if not events:
+        return [], (
+            f"No se encontraron torneos presenciales de Warhammer 40.000 en España "
+            f"desde {start_year} hasta hoy."
+        )
+
+    participants = []
+    event_matches = []
+    failed_events = []
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(load_bcp_event_data, event): event for event in events}
+        for future in as_completed(futures):
+            event = futures[future]
+            try:
+                event_participants, matches = future.result()
+            except Exception as exc:
+                failed_events.append(
+                    f"{event.get('name', event.get('id', 'evento'))}: {type(exc).__name__}: {exc}"
+                )
+                print(f"BCP event unavailable ({event.get('id')}): {exc}")
+                continue
+            participants.extend(event_participants)
+            event_matches.extend(matches)
+
+    matches = matches_override or event_matches
+    known_names = {normalize_player_name(item).casefold() for item in participants if normalize_player_name(item)}
+    for match in matches:
+        for name in (match["player"], match["opponent"]):
+            if name.casefold() not in known_names:
+                participants.append({"name": name, "placement": 999})
+                known_names.add(name.casefold())
+
+    try:
+        players = calculate_tournament_elo(participants, matches, initial_ratings)
+    except ValueError as exc:
+        return [], f"No se pudo calcular el ELO: {exc}"
+
+    if not players:
+        return [], "Los torneos no devolvieron jugadores para calcular el ELO."
+
+    month_names = (
+        "enero", "febrero", "marzo", "abril", "mayo", "junio",
+        "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+    )
+    month_name = month_names[cutoff_local.month - 1]
+    period_label = f"desde enero de {start_year} hasta el {cutoff_local.day} de {month_name} de {end_year}"
+    if matches_override:
+        message = (
+            f"ELO calculado con {len(matches)} partidas de matches.json; "
+            f"roster de {len(events)} torneos presenciales de España, {period_label}."
+        )
+    elif matches:
+        message = (
+            f"ELO calculado con {len(matches)} partidas de {len(events)} torneos presenciales "
+            f"de España, {period_label}, K={K_FACTOR}."
+        )
+    else:
+        message = (
+            f"Sin partidas completadas; ELO inicial {DEFAULT_ELO} para {len(players)} jugadores, "
+            f"{period_label}."
+        )
+    if failed_events:
+        message += f" Error en {len(failed_events)} torneos: {'; '.join(failed_events)}."
+    return players, message
 
 
 def load_players_from_bcp():
@@ -476,7 +750,109 @@ def load_players_from_bcp():
     return []
 
 
+def players_cache_key(cache_date=None):
+    try:
+        local_zone = ZoneInfo("Europe/Madrid")
+    except ZoneInfoNotFoundError:
+        local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+
+    try:
+        matches_mtime = MATCHES_FILE.stat().st_mtime_ns
+    except OSError:
+        matches_mtime = None
+
+    settings = {
+        "source": JSON_URL or "bcp_spain",
+        "date": cache_date or datetime.now(local_zone).date().isoformat(),
+        "ranking_start_year": RANKING_START_YEAR,
+        "ranking_cache_version": RANKING_CACHE_VERSION,
+        "default_elo": DEFAULT_ELO,
+        "game_system": BCP_GAME_SYSTEM_ID,
+        "areas": BCP_SEARCH_AREAS,
+        "k_factor": K_FACTOR,
+        "matches_mtime": matches_mtime,
+    }
+    serialized = json.dumps(settings, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def load_persisted_players(cache_key):
+    try:
+        with sqlite3.connect(CACHE_DB_FILE, timeout=10) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS player_cache ("
+                "cache_key TEXT PRIMARY KEY, updated_at REAL NOT NULL, payload TEXT NOT NULL)"
+            )
+            row = connection.execute(
+                "SELECT updated_at, payload FROM player_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            if not row or time_module.time() - row[0] >= CACHE_TTL_SECONDS:
+                try:
+                    local_zone = ZoneInfo("Europe/Madrid")
+                except ZoneInfoNotFoundError:
+                    local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+                today = datetime.now(local_zone).date()
+                for days_back in range(1, 8):
+                    previous_date = (today - timedelta(days=days_back)).isoformat()
+                    previous_key = players_cache_key(previous_date)
+                    if previous_key == cache_key:
+                        continue
+                    row = connection.execute(
+                        "SELECT updated_at, payload FROM player_cache WHERE cache_key = ?",
+                        (previous_key,),
+                    ).fetchone()
+                    if row and time_module.time() - row[0] < CACHE_TTL_SECONDS:
+                        break
+        if row and time_module.time() - row[0] < CACHE_TTL_SECONDS:
+            return json.loads(row[1])
+    except (OSError, sqlite3.Error, json.JSONDecodeError) as exc:
+        print(f"Persistent ranking cache unavailable: {exc}")
+    return None
+
+
+def save_persisted_players(cache_key, payload):
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False)
+        with sqlite3.connect(CACHE_DB_FILE, timeout=10) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS player_cache ("
+                "cache_key TEXT PRIMARY KEY, updated_at REAL NOT NULL, payload TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT OR REPLACE INTO player_cache (cache_key, updated_at, payload) VALUES (?, ?, ?)",
+                (cache_key, time_module.time(), serialized),
+            )
+    except (OSError, sqlite3.Error) as exc:
+        print(f"Could not save persistent ranking cache: {exc}")
+
+
 def get_players_response():
+    now = time_module.monotonic()
+    cache_key = players_cache_key()
+    if (
+        PLAYERS_CACHE["key"] == cache_key
+        and PLAYERS_CACHE["payload"] is not None
+        and now < PLAYERS_CACHE["expires_at"]
+    ):
+        return PLAYERS_CACHE["payload"]
+
+    cached_response = load_persisted_players(cache_key)
+    if cached_response is not None:
+        cached_default_elo = cached_response.get("default_elo", 1500)
+        if cached_default_elo != DEFAULT_ELO:
+            rating_adjustment = DEFAULT_ELO - cached_default_elo
+            for player in cached_response.get("players", []):
+                player["elo"] = round(float(player["elo"]) + rating_adjustment, 2)
+            cached_response["default_elo"] = DEFAULT_ELO
+            save_persisted_players(cache_key, cached_response)
+        PLAYERS_CACHE.update({
+            "key": cache_key,
+            "expires_at": now + CACHE_TTL_SECONDS,
+            "payload": cached_response,
+        })
+        return cached_response
+
     matches, initial_ratings, matches_error = load_match_results()
 
     if JSON_URL:
@@ -485,25 +861,32 @@ def get_players_response():
             message = elo_message or f"ELO inicial 1500; no se aplicaron partidas."
             if matches_error:
                 message = f"{message} Se ignoró matches.json: {matches_error}"
-            return {"players": remote_players, "source": "tournament", "message": message}
-        return {
-            "players": [],
-            "source": "unavailable",
-            "message": load_error or "No se pudieron cargar las clasificaciones del torneo.",
+            response = {"players": remote_players, "source": "tournament", "message": message}
+        else:
+            response = {
+                "players": [],
+                "source": "unavailable",
+                "message": load_error or "No se pudieron cargar las clasificaciones del torneo.",
+            }
+    else:
+        players, message = load_players_from_spain_since_2025(matches, initial_ratings)
+        if matches_error:
+            message += f" Se ignoró matches.json: {matches_error}"
+        response = {
+            "players": players,
+            "source": "bcp_spain" if players else "unavailable",
+            "message": message,
         }
 
-    local_players = load_players_from_json_file(matches, initial_ratings)
-    if local_players:
-        return {"players": local_players, "source": "local_json"}
-
-    bcp_players = load_players_from_bcp()
-    if bcp_players:
-        return {"players": bcp_players, "source": "bcp"}
-    return {
-        "players": [],
-        "source": "unavailable",
-        "message": "No hay datos de torneo disponibles.",
-    }
+    response["default_elo"] = DEFAULT_ELO
+    if response.get("players"):
+        save_persisted_players(cache_key, response)
+    PLAYERS_CACHE.update({
+        "key": cache_key,
+        "expires_at": time_module.monotonic() + CACHE_TTL_SECONDS,
+        "payload": response,
+    })
+    return response
 
 
 class Handler(BaseHTTPRequestHandler):
