@@ -1,3 +1,5 @@
 ranking_cache.sqlite3
 ranking_cache.sqlite3-shm
 ranking_cache.sqlite3-wal
+update_ranking.log
+__pycache__/

@@ -14,19 +14,27 @@
             <p class="eyebrow">Warhammer 40k</p>
             <h1>Ranking ELO</h1>
           </div>
+          <span class="beta-badge" aria-label="Versión beta" title="Versión beta">BETA</span>
         </header>
 
         <form id="searchForm" class="search-form">
           <label for="playerName">Nombre del jugador</label>
-          <div class="input-row">
-            <input
-              id="playerName"
-              name="playerName"
-              type="text"
-              placeholder="Ej: GitHub Copilot"
-              autocomplete="off"
-            />
-            <button type="submit">Buscar</button>
+          <div class="search-control">
+            <div class="input-row">
+              <input
+                id="playerName"
+                name="playerName"
+                type="text"
+                placeholder="Ej: GitHub Copilot"
+                autocomplete="off"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-controls="playerSuggestions"
+                aria-expanded="false"
+              />
+              <button type="submit">Buscar</button>
+            </div>
+            <div id="playerSuggestions" class="player-suggestions hidden" role="listbox" aria-label="Jugadores"></div>
           </div>
         </form>
 
@@ -39,40 +47,53 @@
               <strong id="playerElo">-</strong>
             </div>
             <div>
-              <span class="label">Victorias</span>
-              <strong id="playerWins">-</strong>
-            </div>
-            <div>
-              <span class="label">Derrotas</span>
-              <strong id="playerLosses">-</strong>
+              <span class="label">Partidas</span>
+              <strong id="playerGames">-</strong>
             </div>
           </div>
         </section>
 
         <section class="table-wrap">
-          <h2>Top jugadores</h2>
-          <p id="rankingStatus" class="ranking-status" role="status"></p>
+          <h2>Lista de jugadores</h2>
           <table>
             <thead>
               <tr>
                 <th>#</th>
                 <th>Jugador</th>
-                <th>ELO</th>
-                <th>W</th>
-                <th>L</th>
+                <th id="eloHeader" aria-sort="descending">
+                  <button id="sortElo" class="table-sort" type="button">
+                    ELO <span class="sort-indicator" aria-hidden="true">↓</span>
+                  </button>
+                </th>
+                <th id="gamesHeader" aria-sort="none">
+                  <button id="sortGames" class="table-sort" type="button">
+                    Partidas <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody id="leaderboardBody"></tbody>
           </table>
           <nav id="rankingPagination" class="pagination" aria-label="Paginación del ranking" hidden>
             <button id="previousPage" type="button">Anterior</button>
-            <span id="pageIndicator" aria-live="polite"></span>
+            <button id="pageIndicator" class="page-indicator" type="button" aria-label="Ir a una página" aria-live="polite"></button>
+            <form id="pageJumpForm" class="page-jump" hidden>
+              <input id="pageJumpInput" type="number" min="1" step="1" inputmode="numeric" aria-label="Puesto del jugador" required />
+              <button type="submit">Ir</button>
+              <button id="cancelPageJump" type="button">Cancelar</button>
+            </form>
             <button id="nextPage" type="button">Siguiente</button>
           </nav>
         </section>
+
+        <footer class="attribution">
+          <span>Datos de torneos: <a href="https://www.bestcoastpairings.com/" target="_blank" rel="noopener noreferrer">Best Coast Pairings</a></span>
+          <span>Idea original: <a href="https://elo40k.es/vigilante" target="_blank" rel="noopener noreferrer">ELO40K</a></span>
+          <span>Actualizado: <time id="rankingUpdatedAt">-</time></span>
+        </footer>
       </section>
     </main>
 
-    <script src="script.js?v=5"></script>
+    <script src="script.js?v=15"></script>
   </body>
 </html>

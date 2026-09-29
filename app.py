@@ -27,6 +27,8 @@ BCP_V2_API_ROOT = "https://newprod-api.bestcoastpairings.com/v2/"
 BCP_CLIENT_ID = "web-app"
 BCP_GAME_SYSTEM_ID = "WGMSzfKFYA"
 RANKING_START_YEAR = 2025
+GAMES_COUNT_CACHE_VERSION = 1
+RANKING_CACHE_VERSION = 10
 BCP_SEARCH_AREAS = (
     {"center": {"lat": 40.2, "long": -3.6}, "distance": 700},
     {"center": {"lat": 28.1, "long": -15.5}, "distance": 350},
@@ -34,9 +36,9 @@ BCP_SEARCH_AREAS = (
 SPAIN_COUNTRY_NAMES = {"es", "españa", "spain"}
 K_FACTOR = 32
 DEFAULT_ELO = 1700
-CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-RANKING_CACHE_VERSION = 6
-PLAYERS_CACHE = {"key": None, "expires_at": 0, "payload": None}
+CACHE_MIGRATION_LOOKBACK_DAYS = 30
+INCREMENTAL_DELAY_DAYS = 7
+INCREMENTAL_EVENT_LOOKBACK_DAYS = 30
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -71,6 +73,15 @@ def normalize_player_name(value):
                 return candidate
         return ""
     return str(value).strip()
+
+
+def normalize_player_identity(item, name):
+    user_id = item.get("userId")
+    if not user_id and isinstance(item.get("user"), dict):
+        user_id = item["user"].get("id")
+    if user_id:
+        return f"user:{str(user_id).strip()}"
+    return f"name:{name.casefold()}"
 
 
 def normalize_placement(value, fallback_index):
@@ -177,7 +188,8 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
     if not participants:
         return []
 
-    cleaned_by_name = {}
+    cleaned_by_identity = {}
+    identity_by_name = {}
     for index, item in enumerate(participants):
         if not isinstance(item, dict):
             continue
@@ -185,6 +197,7 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
         name = normalize_player_name(item)
         if not name:
             continue
+        identity = normalize_player_identity(item, name)
 
         placement = normalize_placement(
             item.get("placement")
@@ -203,6 +216,7 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
         games = item.get("games")
         if not isinstance(games, list):
             games = item.get("total_games")
+        games_played = len(games) if isinstance(games, list) else None
         losses = (
             sum(1 for game in games if isinstance(game, dict) and game.get("gameResult") == 0)
             if isinstance(games, list)
@@ -210,66 +224,95 @@ def calculate_tournament_elo(participants, matches=None, initial_ratings=None):
         )
 
         candidate = {
+            "identity": identity,
             "name": name,
             "placement": placement,
+            "event_date": item.get("_event_date", ""),
             "points": points,
             "wins": extract_metric_value(item, "Wins"),
             "losses": losses,
+            "games_played": games_played,
         }
-        name_key = name.casefold()
-        existing = cleaned_by_name.get(name_key)
+        existing = cleaned_by_identity.get(identity)
         if existing:
             existing["placement"] = min(existing["placement"], placement)
             existing["points"] += points or 0
+            if candidate["event_date"] >= existing["event_date"]:
+                existing["name"] = name
+                existing["event_date"] = candidate["event_date"]
             if candidate["wins"] is not None:
                 existing["wins"] = (existing["wins"] or 0) + candidate["wins"]
             if candidate["losses"] is not None:
                 existing["losses"] = (existing["losses"] or 0) + candidate["losses"]
+            if candidate["games_played"] is not None:
+                existing["games_played"] = (existing["games_played"] or 0) + candidate["games_played"]
         else:
-            cleaned_by_name[name_key] = candidate
+            cleaned_by_identity[identity] = candidate
+        identity_by_name.setdefault(name.casefold(), identity)
 
-    if not cleaned_by_name:
+    if not cleaned_by_identity:
         return []
 
-    ranked = sorted(cleaned_by_name.values(), key=lambda item: item["placement"])
-    canonical_names = {player["name"].casefold(): player["name"] for player in ranked}
+    ranked = sorted(cleaned_by_identity.values(), key=lambda item: item["placement"])
     initial_ratings = initial_ratings or {}
     elo = {
-        player["name"]: initial_ratings.get(player["name"].casefold(), DEFAULT_ELO)
+        player["identity"]: initial_ratings.get(
+            player["identity"],
+            initial_ratings.get(player["name"].casefold(), DEFAULT_ELO),
+        )
         for player in ranked
     }
+    match_counts = {player["identity"]: 0 for player in ranked}
 
     for match in sorted(matches or [], key=lambda item: (item.get("event_date", ""), item["round"])):
-        player_name = canonical_names.get(match["player"].casefold())
-        opponent_name = canonical_names.get(match["opponent"].casefold())
-        if not player_name or not opponent_name:
-            unknown_name = match["player"] if not player_name else match["opponent"]
+        player_identity = (
+            f"user:{match['player_id']}" if match.get("player_id") else None
+        )
+        opponent_identity = (
+            f"user:{match['opponent_id']}" if match.get("opponent_id") else None
+        )
+        if player_identity not in elo:
+            player_identity = identity_by_name.get(match["player"].casefold())
+        if opponent_identity not in elo:
+            opponent_identity = identity_by_name.get(match["opponent"].casefold())
+        if player_identity not in elo or opponent_identity not in elo:
+            unknown_name = match["player"] if player_identity not in elo else match["opponent"]
             raise ValueError(f"No se encuentra en el roster el jugador {unknown_name!r}.")
-        if player_name == opponent_name:
+        if player_identity == opponent_identity:
             raise ValueError("Un jugador no puede enfrentarse a sí mismo.")
 
-        expected = 1 / (1 + 10 ** ((elo[opponent_name] - elo[player_name]) / 400))
+        expected = 1 / (1 + 10 ** ((elo[opponent_identity] - elo[player_identity]) / 400))
         score20 = max(
             0.0,
             min(20.0, 10 + (match["player_points"] - match["opponent_points"]) / 5),
         )
         actual = score20 / 20
         change = K_FACTOR * (actual - expected)
-        elo[player_name] += change
-        elo[opponent_name] -= change
+        elo[player_identity] += change
+        elo[opponent_identity] -= change
+        match_counts[player_identity] += 1
+        match_counts[opponent_identity] += 1
 
     players = []
     for player in ranked:
-        name = player["name"]
+        identity = player["identity"]
         players.append({
-            "name": name,
-            "elo": round(elo[name], 2),
-            "wins": player["wins"],
-            "losses": player["losses"],
+            "name": player["name"],
+            "user_id": (
+                player["identity"].split(":", 1)[1]
+                if player["identity"].startswith("user:")
+                else None
+            ),
+            "elo": round(elo[identity], 2),
+            "games_played": (
+                match_counts[identity]
+                if matches
+                else player["games_played"] or 0
+            ),
             "points": player["points"],
         })
 
-    return sorted(players, key=lambda item: (-item["elo"], -(item["wins"] or 0), item["name"]))
+    return sorted(players, key=lambda item: (-item["elo"], -item["games_played"], item["name"]))
 
 
 def fetch_bcp_pairings(params):
@@ -311,8 +354,12 @@ def pairing_to_match(pairing):
     if not isinstance(pairing, dict) or not pairing.get("isDone"):
         return None
 
-    player1 = normalize_player_name(pairing.get("player1"))
-    player2 = normalize_player_name(pairing.get("player2"))
+    player1_data = pairing.get("player1") or {}
+    player2_data = pairing.get("player2") or {}
+    player1 = normalize_player_name(player1_data)
+    player2 = normalize_player_name(player2_data)
+    player1_id = str(player1_data.get("userId") or "").strip() or None
+    player2_id = str(player2_data.get("userId") or "").strip() or None
     metadata = pairing.get("metaData") or {}
     game1 = pairing.get("player1Game") or {}
     game2 = pairing.get("player2Game") or {}
@@ -329,6 +376,7 @@ def pairing_to_match(pairing):
     if (
         not player1
         or not player2
+        or (player1_id and player1_id == player2_id)
         or player1.casefold() == player2.casefold()
         or points1 is None
         or points2 is None
@@ -343,8 +391,12 @@ def pairing_to_match(pairing):
 
     return {
         "round": int(pairing.get("round", 1)),
+        "pairing_id": pairing.get("id") or pairing.get("pairingId"),
+        "event_id": pairing.get("eventId"),
         "player": player1,
         "opponent": player2,
+        "player_id": player1_id,
+        "opponent_id": player2_id,
         "player_points": points1,
         "opponent_points": points2,
     }
@@ -541,7 +593,12 @@ def ranking_period_window():
     return RANKING_START_YEAR, local_now.year, local_zone, local_now, start_utc, end_utc
 
 
-def load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_utc):
+def report_progress(progress_callback, message):
+    if progress_callback:
+        progress_callback(message)
+
+
+def load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_utc, progress_callback=None):
     base_params = {
         "limit": 100,
         "startDate": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -556,9 +613,11 @@ def load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_u
     }
 
     events_by_id = {}
-    for area in BCP_SEARCH_AREAS:
+    for area_index, area in enumerate(BCP_SEARCH_AREAS, start=1):
         next_key = None
+        page_number = 0
         for _ in range(100):
+            page_number += 1
             params = dict(base_params)
             params["location"] = json.dumps({
                 **area,
@@ -567,6 +626,10 @@ def load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_u
             if next_key:
                 params["nextKey"] = next_key
             payload = fetch_json(f"{BCP_V2_API_ROOT}events", params, {"client-id": BCP_CLIENT_ID})
+            report_progress(
+                progress_callback,
+                f"Eventos: zona {area_index}/{len(BCP_SEARCH_AREAS)}, página {page_number}...",
+            )
             page_events = payload.get("data") if isinstance(payload, dict) else None
             if not isinstance(page_events, list) or not page_events:
                 break
@@ -593,10 +656,12 @@ def load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_u
                 break
             next_key = new_next_key
 
-    return sorted(
+    sorted_events = sorted(
         events_by_id.values(),
         key=lambda event: (event.get("dates") or {}).get("start", ""),
     )
+    report_progress(progress_callback, f"Eventos encontrados: {len(sorted_events)}.")
+    return sorted_events
 
 
 def load_bcp_event_data(event):
@@ -621,14 +686,463 @@ def load_bcp_event_data(event):
             time_module.sleep(0.5 * (attempt + 1))
 
     event_date = (event.get("dates") or {}).get("start", "")
+    for participant in participants:
+        if isinstance(participant, dict):
+            participant["_event_date"] = event_date
     for match in matches:
         match["event_date"] = event_date
     return participants, matches
 
 
-def load_players_from_spain_since_2025(matches_override, initial_ratings):
+def load_bcp_roster_game_counts(progress_callback=None):
     start_year, end_year, local_zone, cutoff_local, start_utc, end_utc = ranking_period_window()
     events = load_bcp_spain_events(start_year, local_zone, cutoff_local, start_utc, end_utc)
+    counts = {}
+    failed_events = 0
+
+    def fetch_event_counts(event):
+        event_id = event["id"]
+        for attempt in range(3):
+            try:
+                payload = fetch_json(
+                    f"{BCP_API_ROOT}events/{event_id}/players",
+                    {"placings": "true"},
+                    {"client-id": BCP_CLIENT_ID},
+                )
+                counts_for_event = {}
+                for participant in extract_players_from_payload(payload):
+                    name = normalize_player_name(participant)
+                    games = participant.get("games")
+                    if not isinstance(games, list):
+                        games = participant.get("total_games")
+                    if name and isinstance(games, list):
+                        key = name.casefold()
+                        counts_for_event[key] = counts_for_event.get(key, 0) + len(games)
+                return counts_for_event
+            except Exception as exc:
+                if isinstance(exc, HTTPError) and 400 <= exc.code < 500 and exc.code != 429:
+                    raise
+                if attempt == 2:
+                    raise
+                time_module.sleep(0.5 * (attempt + 1))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(fetch_event_counts, event): event for event in events}
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            try:
+                event_counts = future.result()
+            except Exception as exc:
+                failed_events += 1
+                print(f"BCP roster game counts unavailable ({futures[future].get('id')}): {exc}")
+                continue
+            for name, count in event_counts.items():
+                counts[name] = counts.get(name, 0) + count
+            if completed == 1 or completed % 25 == 0 or completed == len(events):
+                report_progress(progress_callback, f"Rosters consultados: {completed}/{len(events)}.")
+
+    return counts, len(events) - failed_events, failed_events
+
+
+def ranking_data_through(response):
+    message = response.get("message", "")
+    month_numbers = {
+        name: index
+        for index, name in enumerate((
+            "enero", "febrero", "marzo", "abril", "mayo", "junio",
+            "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+        ), start=1)
+    }
+    match = re.search(r"hasta el (\d{1,2}) de ([a-záéíóúñ]+) de (\d{4})", message, re.IGNORECASE)
+    if match:
+        day, month_name, year = match.groups()
+        month = month_numbers.get(month_name.casefold())
+        if month:
+            try:
+                zone = ZoneInfo("Europe/Madrid")
+            except ZoneInfoNotFoundError:
+                zone = datetime.now().astimezone().tzinfo or timezone.utc
+            return datetime(int(year), month, int(day), 23, 59, 59, tzinfo=zone)
+
+    cached_at = response.get("cached_at")
+    if cached_at:
+        try:
+            cached_time = datetime.fromisoformat(cached_at)
+            if cached_time.tzinfo is None:
+                cached_time = cached_time.replace(tzinfo=timezone.utc)
+            return cached_time.astimezone(ZoneInfo("Europe/Madrid")) - timedelta(days=1)
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        local_zone = ZoneInfo("Europe/Madrid")
+    except ZoneInfoNotFoundError:
+        local_zone = datetime.now().astimezone().tzinfo or timezone.utc
+    return datetime.now(local_zone) - timedelta(days=1)
+
+
+def ensure_incremental_tables(connection):
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS incremental_state ("
+        "state_key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS incremental_pairings ("
+        "pairing_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, applied_at REAL NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS incremental_pending_events ("
+        "event_id TEXT PRIMARY KEY, event_json TEXT NOT NULL)"
+    )
+
+
+def load_incremental_identity_directory(events, progress_callback=None):
+    ids_by_name = {}
+    latest_name_by_id = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {
+            executor.submit(fetch_json,
+                f"{BCP_API_ROOT}events/{event['id']}/players",
+                {"placings": "true"},
+                {"client-id": BCP_CLIENT_ID},
+            ): event
+            for event in events
+        }
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            event = futures[future]
+            event_date = (event.get("dates") or {}).get("start", "")
+            try:
+                participants = extract_players_from_payload(future.result())
+            except Exception as exc:
+                print(f"BCP identity bootstrap unavailable ({event.get('id')}): {exc}")
+                if completed == 1 or completed % 25 == 0 or completed == len(events):
+                    report_progress(progress_callback, f"Rosters para asociar IDs: {completed}/{len(events)}.")
+                continue
+
+            for participant in participants:
+                name = normalize_player_name(participant)
+                user_id = participant.get("userId") or (
+                    participant.get("user", {}).get("id")
+                    if isinstance(participant.get("user"), dict)
+                    else None
+                )
+                if not name or not user_id:
+                    continue
+                user_id = str(user_id).strip()
+                ids_by_name.setdefault(name.casefold(), set()).add(user_id)
+                previous = latest_name_by_id.get(user_id)
+                if previous is None or event_date >= previous[0]:
+                    latest_name_by_id[user_id] = (event_date, name)
+            if completed == 1 or completed % 25 == 0 or completed == len(events):
+                report_progress(progress_callback, f"Rosters para asociar IDs: {completed}/{len(events)}.")
+
+    return ids_by_name, latest_name_by_id
+
+
+def initialize_incremental_state(cache_key, response, progress_callback=None):
+    with sqlite3.connect(CACHE_DB_FILE, timeout=10) as connection:
+        ensure_incremental_tables(connection)
+        state = connection.execute(
+            "SELECT value FROM incremental_state WHERE state_key = 'last_sync_at'"
+        ).fetchone()
+        if state:
+            return response
+
+    report_progress(progress_callback, "Inicializando IDs BCP a partir del ranking guardado...")
+    start_year, _, local_zone, cutoff_local, start_utc, end_utc = ranking_period_window()
+    events = load_bcp_spain_events(
+        start_year, local_zone, cutoff_local, start_utc, end_utc, progress_callback
+    )
+    ids_by_name, latest_name_by_id = load_incremental_identity_directory(events, progress_callback)
+    for player in response.get("players", []):
+        matching_ids = ids_by_name.get(player["name"].casefold(), set())
+        if len(matching_ids) == 1:
+            user_id = next(iter(matching_ids))
+            player["user_id"] = user_id
+            latest = latest_name_by_id.get(user_id)
+            if latest:
+                player["name"] = latest[1]
+        else:
+            player["user_id"] = None
+
+    last_sync_at = ranking_data_through(response).isoformat()
+    with sqlite3.connect(CACHE_DB_FILE, timeout=10) as connection:
+        ensure_incremental_tables(connection)
+        connection.execute(
+            "INSERT OR REPLACE INTO incremental_state (state_key, value) VALUES ('last_sync_at', ?)",
+            (last_sync_at,),
+        )
+
+    response["incremental_initialized_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    save_persisted_players(cache_key, response)
+    report_progress(progress_callback, f"Checkpoint inicial guardado: {len(response.get('players', []))} jugadores.")
+    return response
+
+
+def read_incremental_sync_state():
+    with sqlite3.connect(CACHE_DB_FILE, timeout=10) as connection:
+        ensure_incremental_tables(connection)
+        state = connection.execute(
+            "SELECT value FROM incremental_state WHERE state_key = 'last_sync_at'"
+        ).fetchone()
+        pending = connection.execute(
+            "SELECT event_id, event_json FROM incremental_pending_events"
+        ).fetchall()
+        processed = {
+            row[0] for row in connection.execute("SELECT pairing_id FROM incremental_pairings")
+        }
+    return (datetime.fromisoformat(state[0]) if state else None), pending, processed
+
+
+def player_for_incremental_match(players, by_user_id, by_name, name, user_id=None):
+    name = str(name or "").strip()
+    user_id = str(user_id or "").strip() or None
+
+    if user_id and user_id in by_user_id:
+        player = by_user_id[user_id]
+        if name:
+            old_key = player["name"].casefold()
+            player["name"] = name
+            by_name.setdefault(old_key, []).append(player)
+            by_name.setdefault(name.casefold(), []).append(player)
+        return player
+
+    candidates = by_name.get(name.casefold(), []) if name else []
+    unique_candidates = list({id(candidate): candidate for candidate in candidates}.values())
+    if len(unique_candidates) == 1:
+        player = unique_candidates[0]
+        if user_id:
+            player["user_id"] = user_id
+            by_user_id[user_id] = player
+        if name:
+            player["name"] = name
+        return player
+
+    player = {
+        "name": name or f"Jugador {user_id or 'sin ID'}",
+        "user_id": user_id,
+        "elo": DEFAULT_ELO,
+        "games_played": 0,
+        "points": 0,
+    }
+    players.append(player)
+    by_name.setdefault(player["name"].casefold(), []).append(player)
+    if user_id:
+        by_user_id[user_id] = player
+    return player
+
+
+def commit_incremental_update(cache_key, response, last_sync, new_pairings, pending_events):
+    response["cached_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    serialized = json.dumps(response, ensure_ascii=False)
+    with sqlite3.connect(CACHE_DB_FILE, timeout=30) as connection:
+        ensure_incremental_tables(connection)
+        connection.execute(
+            "INSERT OR REPLACE INTO player_cache (cache_key, updated_at, payload) VALUES (?, ?, ?)",
+            (cache_key, time_module.time(), serialized),
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO incremental_state (state_key, value) VALUES ('last_sync_at', ?)",
+            (last_sync.isoformat(),),
+        )
+        for pairing_id, event_id in new_pairings:
+            connection.execute(
+                "INSERT OR IGNORE INTO incremental_pairings (pairing_id, event_id, applied_at) VALUES (?, ?, ?)",
+                (pairing_id, event_id, time_module.time()),
+            )
+        connection.execute("DELETE FROM incremental_pending_events")
+        connection.executemany(
+            "INSERT INTO incremental_pending_events (event_id, event_json) VALUES (?, ?)",
+            [(event_id, json.dumps(event, ensure_ascii=False)) for event_id, event in pending_events.items()],
+        )
+
+
+def refresh_players_incrementally(progress_callback=None):
+    report_progress(progress_callback, "Leyendo ranking y checkpoint guardados...")
+    cache_key = players_cache_key()
+    response = load_persisted_players(cache_key)
+    if not response or response.get("source") != "bcp_spain":
+        raise RuntimeError("No hay un ranking BCP guardado para usar como base.")
+
+    last_sync, pending_rows, processed_pairings = read_incremental_sync_state()
+    if last_sync is None:
+        response = initialize_incremental_state(cache_key, response, progress_callback)
+        last_sync, pending_rows, processed_pairings = read_incremental_sync_state()
+    if last_sync is None:
+        raise RuntimeError("No se pudo inicializar el checkpoint incremental.")
+
+    start_year, _, local_zone, local_now, start_utc, _ = ranking_period_window()
+    safe_cutoff = local_now - timedelta(days=INCREMENTAL_DELAY_DAYS)
+
+    if safe_cutoff <= last_sync:
+        response["update_message"] = (
+            f"Sin torneos elegibles: el ranking ya llega al {last_sync.strftime('%d/%m/%Y')} "
+            f"y se esperan {INCREMENTAL_DELAY_DAYS} días."
+        )
+        return response
+
+    safe_cutoff_utc = safe_cutoff.astimezone(timezone.utc)
+    events = load_bcp_spain_events(
+        start_year, local_zone, safe_cutoff, start_utc, safe_cutoff_utc, progress_callback
+    )
+    events_by_id = {event["id"]: event for event in events}
+    pending_events = {event_id: json.loads(event_json) for event_id, event_json in pending_rows}
+    candidates = {}
+
+    for event_id, event in pending_events.items():
+        if event_id in events_by_id:
+            event = events_by_id[event_id]
+        candidates[event_id] = event
+
+    for event in events:
+        event_id = event["id"]
+        event_start = incremental_event_datetime(event, "start", local_zone)
+        if event_start and event_start > last_sync:
+            candidates[event_id] = event
+    report_progress(progress_callback, f"Eventos que requieren revisión: {len(candidates)}.")
+
+    players = response.get("players", [])
+    by_user_id = {
+        str(player["user_id"]): player
+        for player in players
+        if player.get("user_id")
+    }
+    by_name = {}
+    for player in players:
+        by_name.setdefault(player["name"].casefold(), []).append(player)
+
+    new_pairings = []
+    pending_next = {}
+    unresolved_starts = []
+    new_game_count = 0
+    completed_events = 0
+    failed_events = []
+    stale_pending_before = local_now - timedelta(days=INCREMENTAL_EVENT_LOOKBACK_DAYS)
+
+    ordered_candidates = sorted(
+        candidates.items(),
+        key=lambda pair: (pair[1].get("dates") or {}).get("start", ""),
+    )
+    for event_index, (event_id, event) in enumerate(ordered_candidates, start=1):
+        event_start = incremental_event_datetime(event, "start", local_zone)
+        event_end = incremental_event_datetime(event, "end", local_zone) or event_start
+        if event_start and event_start <= last_sync and event_id not in pending_events:
+            continue
+        if event_end and event_end > safe_cutoff:
+            pending_next[event_id] = event
+            if event_start:
+                unresolved_starts.append(event_start)
+            continue
+
+        report_progress(
+            progress_callback,
+            f"[{event_index}/{len(ordered_candidates)}] Procesando {event.get('name', event_id)}...",
+        )
+        try:
+            participants, matches = load_bcp_event_data(event)
+        except Exception as exc:
+            print(f"Incremental BCP event unavailable ({event_id}): {exc}")
+            failed_events.append(event_id)
+            pending_next[event_id] = event
+            if event_start:
+                unresolved_starts.append(event_start)
+            continue
+
+        for participant in participants:
+            games = participant.get("games") or participant.get("total_games")
+            if not games:
+                continue
+            participant_name = normalize_player_name(participant)
+            participant_id = participant.get("userId") or (
+                participant.get("user", {}).get("id")
+                if isinstance(participant.get("user"), dict)
+                else None
+            )
+            player_for_incremental_match(players, by_user_id, by_name, participant_name, participant_id)
+
+        event_new_games = 0
+        for match in sorted(matches, key=lambda item: item["round"]):
+            pairing_id = match.get("pairing_id") or (
+                f"{event_id}:{match['round']}:"
+                f"{match.get('player_id') or match['player'].casefold()}:"
+                f"{match.get('opponent_id') or match['opponent'].casefold()}"
+            )
+            if pairing_id in processed_pairings:
+                continue
+
+            first = player_for_incremental_match(
+                players, by_user_id, by_name, match["player"], match.get("player_id")
+            )
+            second = player_for_incremental_match(
+                players, by_user_id, by_name, match["opponent"], match.get("opponent_id")
+            )
+            if first is second:
+                continue
+
+            expected = 1 / (1 + 10 ** ((second["elo"] - first["elo"]) / 400))
+            score20 = max(
+                0.0,
+                min(20.0, 10 + (match["player_points"] - match["opponent_points"]) / 5),
+            )
+            change = K_FACTOR * (score20 / 20 - expected)
+            first["elo"] = round(first["elo"] + change, 2)
+            second["elo"] = round(second["elo"] - change, 2)
+            first["games_played"] = first.get("games_played", 0) + 1
+            second["games_played"] = second.get("games_played", 0) + 1
+            processed_pairings.add(pairing_id)
+            new_pairings.append((pairing_id, event_id))
+            event_new_games += 1
+
+        new_game_count += event_new_games
+        if event_new_games:
+            completed_events += 1
+        if event_end and event_end >= stale_pending_before:
+            pending_next[event_id] = event
+        elif not matches:
+            failed_events.append(event_id)
+            if event_start:
+                unresolved_starts.append(event_start)
+        if event_index == 1 or event_index % 10 == 0 or event_index == len(ordered_candidates):
+            report_progress(
+                progress_callback,
+                f"Progreso: {event_index}/{len(ordered_candidates)} eventos; "
+                f"{new_game_count} partidas nuevas.",
+            )
+
+    if unresolved_starts:
+        next_sync = min([safe_cutoff] + [event_start - timedelta(seconds=1) for event_start in unresolved_starts])
+    else:
+        next_sync = safe_cutoff
+
+    players.sort(key=lambda player: (-player["elo"], -player.get("games_played", 0), player["name"]))
+    response["players"] = players
+    response["message"] = (
+        f"Actualización incremental: {new_game_count} partidas nuevas de {completed_events} torneos; "
+        f"datos hasta el {next_sync.strftime('%d/%m/%Y')}, margen de {INCREMENTAL_DELAY_DAYS} días."
+    )
+    response["incremental_new_games"] = new_game_count
+    response["default_elo"] = DEFAULT_ELO
+    response["games_count_version"] = GAMES_COUNT_CACHE_VERSION
+    if failed_events:
+        response["message"] += f" {len(failed_events)} torneos quedan pendientes."
+
+    commit_incremental_update(cache_key, response, next_sync, new_pairings, pending_next)
+    report_progress(
+        progress_callback,
+        f"Actualización guardada: {new_game_count} partidas, checkpoint {next_sync.strftime('%d/%m/%Y')}.",
+    )
+    return response
+
+
+def load_players_from_spain_since_2025(matches_override, initial_ratings, progress_callback=None):
+    start_year, end_year, local_zone, cutoff_local, start_utc, end_utc = ranking_period_window()
+    report_progress(progress_callback, "Buscando torneos de España...")
+    events = load_bcp_spain_events(
+        start_year, local_zone, cutoff_local, start_utc, end_utc, progress_callback
+    )
     if not events:
         return [], (
             f"No se encontraron torneos presenciales de Warhammer 40.000 en España "
@@ -640,7 +1154,7 @@ def load_players_from_spain_since_2025(matches_override, initial_ratings):
     failed_events = []
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(load_bcp_event_data, event): event for event in events}
-        for future in as_completed(futures):
+        for completed, future in enumerate(as_completed(futures), start=1):
             event = futures[future]
             try:
                 event_participants, matches = future.result()
@@ -652,6 +1166,12 @@ def load_players_from_spain_since_2025(matches_override, initial_ratings):
                 continue
             participants.extend(event_participants)
             event_matches.extend(matches)
+            if completed == 1 or completed % 10 == 0 or completed == len(events):
+                report_progress(
+                    progress_callback,
+                    f"Eventos descargados: {completed}/{len(events)}; "
+                    f"partidas válidas: {len(event_matches)}.",
+                )
 
     matches = matches_override or event_matches
     known_names = {normalize_player_name(item).casefold() for item in participants if normalize_player_name(item)}
@@ -750,7 +1270,7 @@ def load_players_from_bcp():
     return []
 
 
-def players_cache_key(cache_date=None):
+def players_cache_key(cache_date=None, cache_version=None):
     try:
         local_zone = ZoneInfo("Europe/Madrid")
     except ZoneInfoNotFoundError:
@@ -760,18 +1280,18 @@ def players_cache_key(cache_date=None):
         matches_mtime = MATCHES_FILE.stat().st_mtime_ns
     except OSError:
         matches_mtime = None
-
     settings = {
         "source": JSON_URL or "bcp_spain",
-        "date": cache_date or datetime.now(local_zone).date().isoformat(),
         "ranking_start_year": RANKING_START_YEAR,
-        "ranking_cache_version": RANKING_CACHE_VERSION,
+        "ranking_cache_version": cache_version or RANKING_CACHE_VERSION,
         "default_elo": DEFAULT_ELO,
         "game_system": BCP_GAME_SYSTEM_ID,
         "areas": BCP_SEARCH_AREAS,
         "k_factor": K_FACTOR,
         "matches_mtime": matches_mtime,
     }
+    if cache_date:
+        settings["date"] = cache_date
     serialized = json.dumps(settings, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -787,25 +1307,33 @@ def load_persisted_players(cache_key):
                 "SELECT updated_at, payload FROM player_cache WHERE cache_key = ?",
                 (cache_key,),
             ).fetchone()
-            if not row or time_module.time() - row[0] >= CACHE_TTL_SECONDS:
+            migrated = False
+            if not row:
                 try:
                     local_zone = ZoneInfo("Europe/Madrid")
                 except ZoneInfoNotFoundError:
                     local_zone = datetime.now().astimezone().tzinfo or timezone.utc
                 today = datetime.now(local_zone).date()
-                for days_back in range(1, 8):
+                legacy_versions = range(RANKING_CACHE_VERSION, max(RANKING_CACHE_VERSION - 5, 0), -1)
+                for days_back in range(CACHE_MIGRATION_LOOKBACK_DAYS + 1):
                     previous_date = (today - timedelta(days=days_back)).isoformat()
-                    previous_key = players_cache_key(previous_date)
-                    if previous_key == cache_key:
-                        continue
-                    row = connection.execute(
-                        "SELECT updated_at, payload FROM player_cache WHERE cache_key = ?",
-                        (previous_key,),
-                    ).fetchone()
-                    if row and time_module.time() - row[0] < CACHE_TTL_SECONDS:
+                    for legacy_version in legacy_versions:
+                        legacy_key = players_cache_key(previous_date, legacy_version)
+                        row = connection.execute(
+                            "SELECT updated_at, payload FROM player_cache WHERE cache_key = ?",
+                            (legacy_key,),
+                        ).fetchone()
+                        if row:
+                            migrated = True
+                            break
+                    if row:
                         break
-        if row and time_module.time() - row[0] < CACHE_TTL_SECONDS:
-            return json.loads(row[1])
+        if row:
+            payload = json.loads(row[1])
+            payload["cached_at"] = datetime.fromtimestamp(row[0], timezone.utc).isoformat()
+            if migrated:
+                save_persisted_players(cache_key, payload)
+            return payload
     except (OSError, sqlite3.Error, json.JSONDecodeError) as exc:
         print(f"Persistent ranking cache unavailable: {exc}")
     return None
@@ -813,6 +1341,7 @@ def load_persisted_players(cache_key):
 
 def save_persisted_players(cache_key, payload):
     try:
+        payload["cached_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
         serialized = json.dumps(payload, ensure_ascii=False)
         with sqlite3.connect(CACHE_DB_FILE, timeout=10) as connection:
             connection.execute(
@@ -827,33 +1356,10 @@ def save_persisted_players(cache_key, payload):
         print(f"Could not save persistent ranking cache: {exc}")
 
 
-def get_players_response():
-    now = time_module.monotonic()
+def build_players_response(progress_callback=None):
     cache_key = players_cache_key()
-    if (
-        PLAYERS_CACHE["key"] == cache_key
-        and PLAYERS_CACHE["payload"] is not None
-        and now < PLAYERS_CACHE["expires_at"]
-    ):
-        return PLAYERS_CACHE["payload"]
-
-    cached_response = load_persisted_players(cache_key)
-    if cached_response is not None:
-        cached_default_elo = cached_response.get("default_elo", 1500)
-        if cached_default_elo != DEFAULT_ELO:
-            rating_adjustment = DEFAULT_ELO - cached_default_elo
-            for player in cached_response.get("players", []):
-                player["elo"] = round(float(player["elo"]) + rating_adjustment, 2)
-            cached_response["default_elo"] = DEFAULT_ELO
-            save_persisted_players(cache_key, cached_response)
-        PLAYERS_CACHE.update({
-            "key": cache_key,
-            "expires_at": now + CACHE_TTL_SECONDS,
-            "payload": cached_response,
-        })
-        return cached_response
-
     matches, initial_ratings, matches_error = load_match_results()
+    report_progress(progress_callback, "Generando el ranking completo desde BCP...")
 
     if JSON_URL:
         remote_players, load_error, elo_message = load_players_from_url(JSON_URL, matches, initial_ratings)
@@ -869,7 +1375,9 @@ def get_players_response():
                 "message": load_error or "No se pudieron cargar las clasificaciones del torneo.",
             }
     else:
-        players, message = load_players_from_spain_since_2025(matches, initial_ratings)
+        players, message = load_players_from_spain_since_2025(
+            matches, initial_ratings, progress_callback
+        )
         if matches_error:
             message += f" Se ignoró matches.json: {matches_error}"
         response = {
@@ -879,14 +1387,57 @@ def get_players_response():
         }
 
     response["default_elo"] = DEFAULT_ELO
+    response["games_count_version"] = GAMES_COUNT_CACHE_VERSION
+    return response
+
+
+def refresh_players_cache(progress_callback=None):
+    cache_key = players_cache_key()
+    response = build_players_response(progress_callback)
     if response.get("players"):
         save_persisted_players(cache_key, response)
-    PLAYERS_CACHE.update({
-        "key": cache_key,
-        "expires_at": time_module.monotonic() + CACHE_TTL_SECONDS,
-        "payload": response,
-    })
+        report_progress(progress_callback, "Ranking completo guardado en SQLite.")
     return response
+
+
+def get_players_response():
+    cache_key = players_cache_key()
+    cached_response = load_persisted_players(cache_key)
+    if cached_response is not None:
+        cached_players = cached_response.get("players", [])
+        cache_changed = False
+        if (
+            cached_response.get("source") == "bcp_spain"
+            and cached_response.get("games_count_version") != GAMES_COUNT_CACHE_VERSION
+        ):
+            game_counts, counted_events, failed_events = load_bcp_roster_game_counts()
+            for player in cached_players:
+                player["games_played"] = game_counts.get(player["name"].casefold(), 0)
+            cached_response["games_count_version"] = GAMES_COUNT_CACHE_VERSION
+            cached_response["message"] += (
+                f" Partidas contadas desde rosters de {counted_events} torneos BCP."
+            )
+            if failed_events:
+                cached_response["message"] += f" No se pudieron consultar {failed_events} torneos."
+            cache_changed = True
+
+        cached_default_elo = cached_response.get("default_elo", 1500)
+        if cached_default_elo != DEFAULT_ELO:
+            rating_adjustment = DEFAULT_ELO - cached_default_elo
+            for player in cached_players:
+                player["elo"] = round(float(player["elo"]) + rating_adjustment, 2)
+            cached_response["default_elo"] = DEFAULT_ELO
+            cache_changed = True
+
+        if cache_changed:
+            save_persisted_players(cache_key, cached_response)
+        return cached_response
+
+    return {
+        "players": [],
+        "source": "unavailable",
+        "message": "Todavía no hay un ranking guardado. Ejecuta update_ranking.cmd para actualizarlo desde BCP.",
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
